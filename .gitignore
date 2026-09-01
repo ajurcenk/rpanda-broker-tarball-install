@@ -2,3 +2,8 @@
 redpanda-*.tar.gz
 redpanda-*.manifest.txt
 redpanda-versions/
+
+# Upstream release downloads and unpacked binaries (too large for git)
+redpanda_*.tar.gz
+redpanda-connect
+redpanda-console

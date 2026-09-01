@@ -29,6 +29,15 @@ controlled, manual deployment — not as a substitute for `dnf install redpanda`
 There is one more sharp edge that matters enormously for side-by-side use; see
 [Deploying side by side](#deploying-side-by-side) before you unpack anything.
 
+## Two scripts
+
+| Script | Job |
+|---|---|
+| `redpanda-rpm-to-tarball.sh` | Build a side-by-side tarball out of Redpanda RPMs — the rest of this README |
+| `redpanda-tarball-deploy.sh` | Deploy an official upstream `redpanda-<version>-<arch>.tar.gz` into its own prefix — see [The other script](#the-other-script-deploying-an-official-upstream-tarball) |
+
+They handle **different tarball layouts** and are not interchangeable.
+
 ## Requirements
 
 | Tool | Provided by | Needed for |
@@ -344,3 +353,159 @@ find /tmp/build/.redpanda-25.3.14.build/staging -type f | head
 
 The per-package file counts printed during extraction are a quick sanity check
 that all three payloads landed (70 + 18 + 11 = 99 files for 25.3.14).
+
+## The other script: deploying an official upstream tarball
+
+`redpanda-rpm-to-tarball.sh` *builds* a tarball out of RPMs.
+`redpanda-tarball-deploy.sh` *deploys* the tarball Redpanda already publishes —
+`redpanda-<version>-<arch>.tar.gz` — into its own prefix, so several versions
+can run side by side. Use it when you have an upstream download rather than
+RPMs.
+
+### Know which tarball you have
+
+The two are laid out differently, and a deploy that assumes the wrong one
+silently produces a tree that does not run its own binaries.
+
+| | RPM-repackaged (this repo builds it) | Official upstream download |
+|---|---|---|
+| Filename | `redpanda-25.3.14.tar.gz` | `redpanda-25.2.7-amd64.tar.gz` |
+| Top-level dir | `redpanda-<version>/` | none — `bin/`, `lib/`, `libexec/` at the root |
+| Payload root | `redpanda-<version>/opt/redpanda/` | the archive root *is* `/opt/redpanda` |
+| Extra trees | `etc/`, `usr/lib/systemd/`, `usr/bin/` symlinks | `conf/`, `openssl/`, `usr/share/`, `rpk-fips` |
+| Deploy with | the manual steps in [Deploying side by side](#deploying-side-by-side) | `redpanda-tarball-deploy.sh` |
+
+The script rejects the wrong type during preflight, before it touches the
+filesystem, so a mix-up costs you an error message and nothing else.
+
+### Usage
+
+```bash
+# Into /opt/redpanda-versions/25.2.7 (needs root for /opt)
+sudo ./redpanda-tarball-deploy.sh redpanda-25.2.7-amd64.tar.gz
+
+# Into a directory you own, no root needed
+./redpanda-tarball-deploy.sh -r ~/redpanda-versions redpanda-25.2.7-amd64.tar.gz
+
+# Explicit prefix and a data root on a different filesystem
+./redpanda-tarball-deploy.sh -p /srv/rp/25.2.7 -d /data/rp/25.2.7 \
+    redpanda-25.2.7-amd64.tar.gz
+```
+
+| Option | Meaning |
+|---|---|
+| `-p, --prefix DIR` | Install root. Default `<versions-root>/<version>` |
+| `-r, --versions-root DIR` | Parent of the default prefix. Default `/opt/redpanda-versions`, or `$REDPANDA_VERSIONS_ROOT` |
+| `-V, --version VER` | Version string. Default: parsed from the filename |
+| `-d, --data-dir DIR` | Per-version data root written into `redpanda.yaml`. Default `<prefix>/var/lib/redpanda` |
+| `-f, --force` | Replace an existing prefix; also allows an arch mismatch |
+| `-n, --dry-run` | Print the actions without performing them |
+| `--enable-fips` | Add the `activate = 1` line upstream's `fipsmodule.cnf` omits (see below) |
+| `--no-verify` | Skip running `rpk`/`redpanda` afterwards |
+| `--no-preflight` | Skip the listing, space and checksum pass |
+
+Preflight refuses to start when the archive is not a gzip tar, when the layout
+is the wrong type, when the target filesystem has less free space than the
+uncompressed size plus 5%, when the tarball's architecture does not match the
+host, or when `--prefix` is `/opt/redpanda` or below it — that last one being
+the path the rewrite is trying to get *away* from.
+
+### What it rewrites, and why sed alone is not enough
+
+Three separate passes, because the absolute `/opt/redpanda` paths are baked
+into three different kinds of file.
+
+**1. The `bin/*` wrapper paths.** All nine wrappers are shell scripts that
+hardcode `/opt/redpanda/lib`, `/opt/redpanda/bin` and
+`/opt/redpanda/libexec/<prog>`. Two of them do not relocate by a plain prefix
+substitution, because upstream ships those paths elsewhere in the tree:
+
+| Wrapper says | Tarball actually ships |
+|---|---|
+| `/opt/redpanda/rpk-fips/lib` | `lib/rpk-fips/` |
+| `/opt/redpanda/rpk-fips/lib/ossl-modules/` | `lib/ossl-modules/` |
+| `/opt/redpanda/rpk-fips/openssl/` | `openssl/` |
+
+So the specific rules run before the general one. Every pattern is anchored on
+the opening double quote, which makes each rule match only a quoted absolute
+path and makes the whole pass idempotent — a rewritten file no longer matches
+anything.
+
+**2. The ELF interpreter.** This is the part no `sed` can fix. Eight of the
+nine `libexec/` binaries are dynamically linked, and each carries its loader's
+absolute path in its ELF program header (`PT_INTERP`):
+
+```
+libexec/redpanda   →  /opt/redpanda/lib/ld.so
+libexec/rpk-fips   →  /opt/redpanda/rpk-fips/lib/ld.so
+libexec/rpk        →  <none: statically linked>
+```
+
+That path is inside the binary, not in any script. Left alone, a relocated
+tree fails one of two ways: on a host with no `/opt/redpanda` every dynamic
+binary dies with `cannot execute: required file not found`, and on a host that
+*has* one they run silently under **that** install's loader — which is exactly
+the failure a side-by-side layout is meant to prevent.
+
+The fix is to invoke the bundled loader explicitly, so each wrapper's `exec`
+line becomes:
+
+```bash
+exec "$PREFIX/lib/ld.so" --argv0 "$0" --library-path "$PREFIX/lib" \
+    "$PREFIX/libexec/redpanda" "$@"
+```
+
+`--argv0` keeps the program's own name in its usage text; the script falls back
+to `exec -a` if the bundled loader is too old to support it. Each wrapper
+already names its own loader directory in `LD_LIBRARY_PATH`, and exactly those
+wrappers that set it are the ones whose binary is dynamic, so the mapping needs
+no `readelf`. `rpk` is static and is left alone.
+
+**3. The OpenSSL configuration.** `openssl/*.cnf` carry *unquoted* absolute
+`.include` paths that the wrapper pass never sees:
+
+```
+.include /opt/redpanda/rpk-fips/openssl/fipsmodule.cnf
+```
+
+Both variants point at the single `fipsmodule.cnf` the tarball ships at
+`openssl/`, so both are rewritten to the prefix.
+
+### FIPS mode is broken in the tarball as shipped
+
+Upstream's `fipsmodule.cnf` declares `[fips_sect]` but omits `activate = 1`, so
+the FIPS provider never activates and `rpk-fips` panics:
+
+```
+panic: opensslcrypto: FIPS mode requested (environment variable GOFIPS)
+       but not available in OpenSSL 3.0.18
+```
+
+This is a property of the download, not of relocating it. Adding that one line
+fixes it, and `--enable-fips` does exactly that. It is off by default because
+it changes the tree's crypto posture, which is your decision rather than the
+script's. Without the flag the script reports the diagnosis and continues —
+plain `rpk` and `redpanda` are unaffected either way.
+
+### What you get
+
+```
+$PREFIX/bin/…                       wrappers, rewritten and loader-shimmed
+$PREFIX/libexec/…                   the real binaries, untouched
+$PREFIX/etc/redpanda/redpanda.yaml  per-version config, data paths rewritten
+$PREFIX/var/lib/redpanda/{data,coredump}
+$PREFIX/activate.sh                 source it to put this version on PATH
+$PREFIX/.deploy-info                version, source, sha256, timestamp
+```
+
+Verification runs `rpk`, `redpanda` and `rpk-fips`, then asserts that no
+wrapper still names `/opt/redpanda`. That last check is the one that matters: a
+version string cannot prove a tree is self-contained, because a stock install
+of the same version prints exactly the same thing.
+
+### Still not done for you
+
+The same list as the repackager — no `redpanda` user or group, no file
+capabilities on the binary, no systemd units, no tuners. Two brokers on one
+host also cannot share ports 9092, 9644, 33145, 8081 or 8082, so review the
+generated `redpanda.yaml` before starting a second version.
