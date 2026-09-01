@@ -1,0 +1,4 @@
+# Build artifacts produced by redpanda-rpm-to-tarball.sh
+redpanda-*.tar.gz
+redpanda-*.manifest.txt
+redpanda-versions/
