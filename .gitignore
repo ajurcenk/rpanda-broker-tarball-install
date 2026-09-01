@@ -1,9 +1,17 @@
+# Archives -- this project builds and consumes tarballs; none belong in git.
+# The Redpanda ones run from ~100 MB to over 1 GB, past GitHub's push limit.
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
+*.zip
+
 # Build artifacts produced by redpanda-rpm-to-tarball.sh
-redpanda-*.tar.gz
 redpanda-*.manifest.txt
 redpanda-versions/
 
-# Upstream release downloads and unpacked binaries (too large for git)
-redpanda_*.tar.gz
+# Unpacked upstream binaries (too large for git)
 redpanda-connect
 redpanda-console
